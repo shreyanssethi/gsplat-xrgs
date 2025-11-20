@@ -405,6 +405,10 @@ class Dataset:
             "image": torch.from_numpy(image).float(),
             "image_id": item,  # the index of the image in the dataset
         }
+
+        if hasattr(self.parser, 'cam_to_hr'):
+            data["is_hr"] = self.parser.cam_to_hr[index]
+
         if mask is not None:
             data["mask"] = torch.from_numpy(mask).bool()
 

@@ -294,7 +294,6 @@ def create_splats_with_optimizers(
             eps=1e-15 / math.sqrt(BS),
             # TODO: check betas logic when BS is larger than 10 betas[0] will be zero.
             betas=(1 - BS * (1 - 0.9), 1 - BS * (1 - 0.999)),
-            fused=True,
         )
         for name, _, lr in params
     }
@@ -338,6 +337,18 @@ class Runner:
             normalize=cfg.normalize_world_space,
             test_every=cfg.test_every,
         )
+        
+        # XRGS Change: Adding the HR/LR tags to the dataset
+        metadata = json.load(open(os.path.join(cfg.data_dir, "mixed_res_metadata.json")))
+        hr_set = set(metadata["high_res"])
+        self.parser.cam_to_hr = {}
+
+        for i, img_path in enumerate(self.parser.camera_ids):
+            if os.path.basename(self.parser.image_paths[i]) in hr_set:
+                self.parser.cam_to_hr[i] = True
+            else:
+                self.parser.cam_to_hr[i] = False
+
         self.trainset = Dataset(
             self.parser,
             split="train",
@@ -345,6 +356,13 @@ class Runner:
             load_depths=cfg.depth_loss,
         )
         self.valset = Dataset(self.parser, split="val")
+
+        for i, img in enumerate(self.valset):
+            assert 'is_hr' in img, i
+        for i, img in enumerate(self.trainset):
+            assert 'is_hr' in img, i
+
+
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
         print("Scene scale:", self.scene_scale)
 
@@ -680,12 +698,24 @@ class Runner:
                 info=info,
             )
 
-            # loss
+            # XR-GS Change - Loss is weighted based on the image being HR/LR
+            is_hr = data["is_hr"]
+
+            # Radius weights are used for weighing gradient updates
+            if is_hr:
+                loss_weight = 1.0
+                radius_weight = 1.0      
+            else:
+                loss_weight = 0.25
+                radius_weight = 0.3     
+
             l1loss = F.l1_loss(colors, pixels)
             ssimloss = 1.0 - fused_ssim(
                 colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2), padding="valid"
             )
-            loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
+            base_loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
+            loss = loss_weight * base_loss
+
             if cfg.depth_loss:
                 # query depths from depth map
                 points = torch.stack(
@@ -716,6 +746,12 @@ class Runner:
                 loss += cfg.scale_reg * torch.exp(self.splats["scales"]).mean()
 
             loss.backward()
+
+            # XRGS Change - Decrease the gradient magnitude for LR images
+            for name, param in self.splats.named_parameters():
+                if "scale" in name:
+                    if param.grad is not None:
+                        param.grad.mul_(radius_weight)
 
             desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
             if cfg.depth_loss:
@@ -868,6 +904,7 @@ class Runner:
                     step=step,
                     info=info,
                     packed=cfg.packed,
+                    is_hr=is_hr         # XR-GS Change: Pass HR/LR Tags to the backwards step (Affects growing/pruning Gaussians)
                 )
             elif isinstance(self.cfg.strategy, MCMCStrategy):
                 self.cfg.strategy.step_post_backward(
