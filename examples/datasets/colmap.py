@@ -406,6 +406,7 @@ class Dataset:
             "image_id": item,  # the index of the image in the dataset
         }
 
+        # XR-GS Change: Saves an extra parameter to the data for whether it is HR or not
         if hasattr(self.parser, 'cam_to_hr'):
             data["is_hr"] = self.parser.cam_to_hr[index]
 

@@ -35,7 +35,7 @@ from gsplat.compression import PngCompression
 from gsplat.distributed import cli
 from gsplat.optimizers import SelectiveAdam
 from gsplat.rendering import rasterization
-from gsplat.strategy import DefaultStrategy, MCMCStrategy
+from gsplat.strategy import DefaultStrategy, MCMCStrategy, XRGSStrategy
 from gsplat_viewer import GsplatViewer, GsplatRenderTabState
 from nerfview import CameraState, RenderTabState, apply_float_colormap
 
@@ -112,7 +112,7 @@ class Config:
     far_plane: float = 1e10
 
     # Strategy for GS densification
-    strategy: Union[DefaultStrategy, MCMCStrategy] = field(
+    strategy: Union[DefaultStrategy, MCMCStrategy, XRGSStrategy] = field(
         default_factory=DefaultStrategy
     )
     # Use packed mode for rasterization, this leads to less memory usage but slightly slower.
@@ -195,7 +195,7 @@ class Config:
         self.sh_degree_interval = int(self.sh_degree_interval * factor)
 
         strategy = self.strategy
-        if isinstance(strategy, DefaultStrategy):
+        if isinstance(strategy, DefaultStrategy) or isinstance(strategy, XRGSStrategy):
             strategy.refine_start_iter = int(strategy.refine_start_iter * factor)
             strategy.refine_stop_iter = int(strategy.refine_stop_iter * factor)
             strategy.reset_every = int(strategy.reset_every * factor)
@@ -338,7 +338,7 @@ class Runner:
             test_every=cfg.test_every,
         )
         
-        # XRGS Change: Adding the HR/LR tags to the dataset
+        # XR-GS Change: Adding the HR/LR tags to the dataset
         metadata = json.load(open(os.path.join(cfg.data_dir, "mixed_res_metadata.json")))
         hr_set = set(metadata["high_res"])
         self.parser.cam_to_hr = {}
@@ -396,7 +396,8 @@ class Runner:
         # Densification Strategy
         self.cfg.strategy.check_sanity(self.splats, self.optimizers)
 
-        if isinstance(self.cfg.strategy, DefaultStrategy):
+        if isinstance(self.cfg.strategy, DefaultStrategy) or isinstance(self.cgf.strategy, XRGSStrategy):
+            print("Using strategy:", self.cfg.strategy)
             self.strategy_state = self.cfg.strategy.initialize_state(
                 scene_scale=self.scene_scale
             )
@@ -546,7 +547,7 @@ class Runner:
             packed=self.cfg.packed,
             absgrad=(
                 self.cfg.strategy.absgrad
-                if isinstance(self.cfg.strategy, DefaultStrategy)
+                if (isinstance(self.cfg.strategy, DefaultStrategy) or isinstance(self.cfg.strategy, XRGSStrategy))
                 else False
             ),
             sparse_grad=self.cfg.sparse_grad,
@@ -699,23 +700,29 @@ class Runner:
             )
 
             # XR-GS Change - Loss is weighted based on the image being HR/LR
-            is_hr = data["is_hr"]
+            if isinstance(self.cfg.strategy, XRGSStrategy):
+                is_hr = data["is_hr"]
+                # Radius weights are used for weighing gradient updates
+                if is_hr:
+                    loss_weight = 1.0
+                    radius_weight = 1.0      
+                else:
+                    loss_weight = 0.25
+                    radius_weight = 0.3     
 
-            # Radius weights are used for weighing gradient updates
-            if is_hr:
-                loss_weight = 1.0
-                radius_weight = 1.0      
+                l1loss = F.l1_loss(colors, pixels)
+                ssimloss = 1.0 - fused_ssim(
+                    colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2), padding="valid"
+                )
+                base_loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
+                loss = loss_weight * base_loss
             else:
-                loss_weight = 0.25
-                radius_weight = 0.3     
-
-            l1loss = F.l1_loss(colors, pixels)
-            ssimloss = 1.0 - fused_ssim(
-                colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2), padding="valid"
-            )
-            base_loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
-            loss = loss_weight * base_loss
-
+                l1loss = F.l1_loss(colors, pixels)
+                ssimloss = 1.0 - fused_ssim(
+                    colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2), padding="valid"
+                )
+                loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
+            
             if cfg.depth_loss:
                 # query depths from depth map
                 points = torch.stack(
@@ -747,11 +754,12 @@ class Runner:
 
             loss.backward()
 
-            # XRGS Change - Decrease the gradient magnitude for LR images
-            for name, param in self.splats.named_parameters():
-                if "scale" in name:
-                    if param.grad is not None:
-                        param.grad.mul_(radius_weight)
+            # XR-GS Change - Decrease the gradient magnitude for LR images
+            if isinstance(self.cfg.strategy, XRGSStrategy):
+                for name, param in self.splats.named_parameters():
+                    if "scale" in name:
+                        if param.grad is not None:
+                            param.grad.mul_(radius_weight)
 
             desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
             if cfg.depth_loss:
@@ -897,6 +905,15 @@ class Runner:
 
             # Run post-backward steps after backward and optimizer
             if isinstance(self.cfg.strategy, DefaultStrategy):
+                self.cfg.strategy.step_post_backward(
+                    params=self.splats,
+                    optimizers=self.optimizers,
+                    state=self.strategy_state,
+                    step=step,
+                    info=info,
+                    packed=cfg.packed,
+                )
+            elif isinstance(self.cfg.strategy, XRGSStrategy):
                 self.cfg.strategy.step_post_backward(
                     params=self.splats,
                     optimizers=self.optimizers,
@@ -1246,6 +1263,12 @@ if __name__ == "__main__":
             "Gaussian splatting training using densification heuristics from the original paper.",
             Config(
                 strategy=DefaultStrategy(verbose=True),
+            ),
+        ),
+        "xrgs": (
+            "XRGS modifications made on top of the Default Gaussian Splatting training strategy.",
+            Config(
+                strategy=XRGSStrategy(verbose=True),
             ),
         ),
         "mcmc": (

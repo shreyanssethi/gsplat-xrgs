@@ -9,8 +9,8 @@ from .ops import duplicate, remove, reset_opa, split
 
 
 @dataclass
-class DefaultStrategy(Strategy):
-    """A default strategy that follows the original 3DGS paper:
+class XRGSStrategy(Strategy):
+    """Building upon the Default 3DGS Strategy which changes made for resolution awareness
 
     `3D Gaussian Splatting for Real-Time Radiance Field Rendering <https://arxiv.org/abs/2308.04079>`_
 
@@ -32,16 +32,24 @@ class DefaultStrategy(Strategy):
 
     Args:
         prune_opa (float): GSs with opacity below this value will be pruned. Default is 0.005.
-        grow_grad2d (float): GSs with image plane gradient above this value will be
+
+        # XR-GS Changes: grow_grad2d, grow_scale3d, and prune_scale3d have different values based on LR/HR views
+        grow_grad2d_hr (float): GSs with image plane gradient above this value will be
           split/duplicated. Default is 0.0002.
-        grow_scale3d (float): GSs with 3d scale (normalized by scene_scale) below this
+        grow_grad2d_lr (float): This is the same as the above but will be used specifically for low-res views
+        grow_scale3d_hr (float): GSs with 3d scale (normalized by scene_scale) below this
           value will be duplicated. Above will be split. Default is 0.01.
+        grow_scale3d_lr (float): This is the same as the above but will be used specifically for low-res views 
+        prune_scale3d_hr (float): GSs with 3d scale (normalized by scene_scale) above this
+          value will be pruned. Default is 0.1.
+        prune_scale3d_lr --> This is the same as the above but will be used specifically for low-res views 
+        
+        # Notes to self: The following 2 params are not used by default
         grow_scale2d (float): GSs with 2d scale (normalized by image resolution) above
           this value will be split. Default is 0.05.
-        prune_scale3d (float): GSs with 3d scale (normalized by scene_scale) above this
-          value will be pruned. Default is 0.1.
         prune_scale2d (float): GSs with 2d scale (normalized by image resolution) above
           this value will be pruned. Default is 0.15.
+
         refine_scale2d_stop_iter (int): Stop refining GSs based on 2d scale after this
           iteration. Default is 0. Set to a positive value to enable this feature.
         refine_start_iter (int): Start refining GSs after this iteration. Default is 500.
@@ -77,10 +85,18 @@ class DefaultStrategy(Strategy):
     """
 
     prune_opa: float = 0.005
-    grow_grad2d: float = 0.0002
-    grow_scale3d: float = 0.01
+
+    # XR-GS Changes: Varying values of the following parameters based on HR/LR Views
+    grow_grad2d_hr: float = 0.00015   # more aggressive for HR
+    grow_grad2d_lr: float = 0.0002   # more conservative for LR
+
+    grow_scale3d_hr: float = 0.015    # HR splits/duplicates smaller Gaussians
+    grow_scale3d_lr: float = 0.01    # LR avoids splitting too much
+
+    prune_scale3d_hr: float = 0.07      # Lower so that it is stricter for HR Gaussians 
+    prune_scale3d_lr: float = 0.13      # Higher so that it is lenient for LR Gaussians
+
     grow_scale2d: float = 0.05
-    prune_scale3d: float = 0.1
     prune_scale2d: float = 0.15
     refine_scale2d_stop_iter: int = 0
     refine_start_iter: int = 500
@@ -157,6 +173,7 @@ class DefaultStrategy(Strategy):
         step: int,
         info: Dict[str, Any],
         packed: bool = False,
+        is_hr: bool = True          # XR-GS Change: Pass in is_hr tag from the trainer
     ):
         """Callback function to be executed after the `loss.backward()` call."""
         if step >= self.refine_stop_iter:
@@ -169,16 +186,16 @@ class DefaultStrategy(Strategy):
             and step % self.refine_every == 0
             and step % self.reset_every >= self.pause_refine_after_reset
         ):
-            # grow GSs
-            n_dupli, n_split = self._grow_gs(params, optimizers, state, step)
+            # Pass in is_hr tag to the grow function
+            n_dupli, n_split = self._grow_gs(params, optimizers, state, step, is_hr)
             if self.verbose:
                 print(
                     f"Step {step}: {n_dupli} GSs duplicated, {n_split} GSs split. "
                     f"Now having {len(params['means'])} GSs."
                 )
 
-            # prune GSs
-            n_prune = self._prune_gs(params, optimizers, state, step)
+            # Pass in is_hr tag to the prune function
+            n_prune = self._prune_gs(params, optimizers, state, step, is_hr)
             if self.verbose:
                 print(
                     f"Step {step}: {n_prune} GSs pruned. "
@@ -266,15 +283,24 @@ class DefaultStrategy(Strategy):
         optimizers: Dict[str, torch.optim.Optimizer],
         state: Dict[str, Any],
         step: int,
+        is_hr: bool = True
     ) -> Tuple[int, int]:
         count = state["count"]
         grads = state["grad2d"] / count.clamp_min(1)
         device = grads.device
 
-        is_grad_high = grads > self.grow_grad2d
+        # XR-GS Change: Decide thresholds based on LR/HR View
+        if is_hr:
+            grow_grad2d = self.grow_grad2d_hr
+            grow_scale3d = self.grow_scale3d_hr
+        else:
+            grow_grad2d = self.grow_grad2d_lr
+            grow_scale3d = self.grow_scale3d_lr
+
+        is_grad_high = grads > grow_grad2d
         is_small = (
             torch.exp(params["scales"]).max(dim=-1).values
-            <= self.grow_scale3d * state["scene_scale"]
+            <= grow_scale3d * state["scene_scale"]
         )
         is_dupli = is_grad_high & is_small
         n_dupli = is_dupli.sum().item()
@@ -315,12 +341,20 @@ class DefaultStrategy(Strategy):
         optimizers: Dict[str, torch.optim.Optimizer],
         state: Dict[str, Any],
         step: int,
+        is_hr: bool,
     ) -> int:
+
+        # XR-GS Change: Decide thresholds based on LR/HR View
+        if is_hr:
+            prune_scale3d = self.prune_scale3d_hr
+        else:
+            prune_scale3d = self.prune_scale3d_lr
+
         is_prune = torch.sigmoid(params["opacities"].flatten()) < self.prune_opa
         if step > self.reset_every:
             is_too_big = (
                 torch.exp(params["scales"]).max(dim=-1).values
-                > self.prune_scale3d * state["scene_scale"]
+                > prune_scale3d * state["scene_scale"]
             )
             # The official code also implements sreen-size pruning but
             # it's actually not being used due to a bug:
