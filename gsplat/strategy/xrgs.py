@@ -87,11 +87,11 @@ class XRGSStrategy(Strategy):
     prune_opa: float = 0.005
 
     # XR-GS Changes: Varying values of the following parameters based on HR/LR Views
-    grow_grad2d_hr: float = 0.00015   # more aggressive for HR
-    grow_grad2d_lr: float = 0.0002   # more conservative for LR
+    grow_grad2d_hr: float = 0.00015   # more aggressive for HR (Duplicate/Split More Easily)
+    grow_grad2d_lr: float = 0.0002   # more conservative for LR (Duplicate/Split More Conservatively)
 
-    grow_scale3d_hr: float = 0.015    # HR splits/duplicates smaller Gaussians
-    grow_scale3d_lr: float = 0.01    # LR avoids splitting too much
+    grow_scale3d_hr: float = 0.08    # HR splits/duplicates Gaussians more quickly
+    grow_scale3d_lr: float = 0.012    # LR avoids splitting too much
 
     prune_scale3d_hr: float = 0.07      # Lower so that it is stricter for HR Gaussians 
     prune_scale3d_lr: float = 0.13      # Higher so that it is lenient for LR Gaussians
