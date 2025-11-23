@@ -396,7 +396,7 @@ class Runner:
         # Densification Strategy
         self.cfg.strategy.check_sanity(self.splats, self.optimizers)
 
-        if isinstance(self.cfg.strategy, DefaultStrategy) or isinstance(self.cgf.strategy, XRGSStrategy):
+        if isinstance(self.cfg.strategy, DefaultStrategy) or isinstance(self.cfg.strategy, XRGSStrategy):
             print("Using strategy:", self.cfg.strategy)
             self.strategy_state = self.cfg.strategy.initialize_state(
                 scene_scale=self.scene_scale
@@ -655,6 +655,15 @@ class Runner:
             # sh schedule
             sh_degree_to_use = min(step // cfg.sh_degree_interval, cfg.sh_degree)
 
+            # XR-GS Change: Storing the variables for this step of training
+            use_xrgs = isinstance(self.cfg.strategy, XRGSStrategy)
+
+            # XR-GS Change: Radius Scaling for LR Images (Resolution Aware Rendering)
+            # Done as Ablation -- Did not work well
+            # if use_xrgs and not data["is_hr"]:
+            #     radius_backup = self.splats.scales.data.clone()
+            #     self.splats.scales.data = radius_backup * 1.3 
+
             # forward
             renders, alphas, info = self.rasterize_splats(
                 camtoworlds=camtoworlds,
@@ -668,6 +677,12 @@ class Runner:
                 render_mode="RGB+ED" if cfg.depth_loss else "RGB",
                 masks=masks,
             )
+            
+            # XR-GS: Restore original radii so the model parameters stay correct
+            # Done as Ablation -- Did not work well
+            # if use_xrgs and not data["is_hr"]:
+            #     self.splats.scales.data = radius_backup
+
             if renders.shape[-1] == 4:
                 colors, depths = renders[..., 0:3], renders[..., 3:4]
             else:
@@ -700,7 +715,7 @@ class Runner:
             )
 
             # XR-GS Change - Loss is weighted based on the image being HR/LR
-            if isinstance(self.cfg.strategy, XRGSStrategy):
+            if use_xrgs:
                 is_hr = data["is_hr"]
                 # Radius weights are used for weighing gradient updates
                 if is_hr:
@@ -755,7 +770,7 @@ class Runner:
             loss.backward()
 
             # XR-GS Change - Decrease the gradient magnitude for LR images
-            if isinstance(self.cfg.strategy, XRGSStrategy):
+            if use_xrgs:
                 for name, param in self.splats.named_parameters():
                     if "scale" in name:
                         if param.grad is not None:
