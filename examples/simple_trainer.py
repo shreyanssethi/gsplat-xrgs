@@ -78,10 +78,14 @@ class Config:
 
     # Number of training steps
     max_steps: int = 30_000
+
+    # XR-GS Change: Number of LR only train steps
+    lr_only_steps: int = 5_000
+
     # Steps to evaluate the model
-    eval_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
+    eval_steps: List[int] = field(default_factory=lambda: [5_000, 7_000, 30_000])
     # Steps to save the model
-    save_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
+    save_steps: List[int] = field(default_factory=lambda: [5_000, 7_000, 30_000])
     # Whether to save ply file (storage size can be large)
     save_ply: bool = False
     # Steps to save the model as ply
@@ -619,6 +623,10 @@ class Runner:
         # Training loop.
         global_tic = time.time()
         pbar = tqdm.tqdm(range(init_step, max_steps))
+
+        # XR-GS Change: Storing the variables for this step of training
+        use_xrgs = isinstance(self.cfg.strategy, XRGSStrategy)
+
         for step in pbar:
             if not cfg.disable_viewer:
                 while self.viewer.state == "paused":
@@ -626,11 +634,22 @@ class Runner:
                 self.viewer.lock.acquire()
                 tic = time.time()
 
-            try:
-                data = next(trainloader_iter)
-            except StopIteration:
-                trainloader_iter = iter(trainloader)
-                data = next(trainloader_iter)
+                # XR-GS Change: First train with only LR Views
+                while True:
+                    try:
+                        data = next(trainloader_iter)
+                    except StopIteration:
+                        trainloader_iter = iter(trainloader)
+                        data = next(trainloader_iter)
+
+                    # if XRGS is enabled AND we're still in lr_only_steps,
+                    # we want ONLY low-res batches (i.e., is_hr == False)
+                    if use_xrgs and data["is_hr"] and step < self.cfg.lr_only_steps:
+                        # skip this batch, fetch next — but DO NOT increment step
+                        continue
+
+                    # found a valid batch → break out and continue training
+                    break
 
             camtoworlds = camtoworlds_gt = data["camtoworld"].to(device)  # [1, 4, 4]
             Ks = data["K"].to(device)  # [1, 3, 3]
@@ -654,9 +673,6 @@ class Runner:
 
             # sh schedule
             sh_degree_to_use = min(step // cfg.sh_degree_interval, cfg.sh_degree)
-
-            # XR-GS Change: Storing the variables for this step of training
-            use_xrgs = isinstance(self.cfg.strategy, XRGSStrategy)
 
             # XR-GS Change: Radius Scaling for LR Images (Resolution Aware Rendering)
             # Done as Ablation -- Did not work well
@@ -714,9 +730,10 @@ class Runner:
                 info=info,
             )
 
+            is_hr = data.get("is_hr", False)
+
             # XR-GS Change - Loss is weighted based on the image being HR/LR
             if use_xrgs:
-                is_hr = data["is_hr"]
                 # Radius weights are used for weighing gradient updates
                 if is_hr:
                     loss_weight = 1.0
