@@ -79,13 +79,13 @@ class Config:
     # Number of training steps
     max_steps: int = 30_000
 
-    # XR-GS Change: Number of LR only train steps
-    lr_only_steps: int = 5_000
+    # XR-GS Change: Number of LR only train steps --> NOTE: Off by default
+    lr_only_steps: int = 0
 
     # Steps to evaluate the model
-    eval_steps: List[int] = field(default_factory=lambda: [5_000, 7_000, 30_000])
+    eval_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
     # Steps to save the model
-    save_steps: List[int] = field(default_factory=lambda: [5_000, 7_000, 30_000])
+    save_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
     # Whether to save ply file (storage size can be large)
     save_ply: bool = False
     # Steps to save the model as ply
@@ -361,6 +361,10 @@ class Runner:
         )
         self.valset = Dataset(self.parser, split="val")
 
+        # XR-GS Change: Create the synthetic LR/HR pair for every image
+        if isinstance(cfg.strategy, XRGSStrategy):
+            self.synthetic_pairs = self.precompute_xrgs_pairs_two_res(self.trainset)
+
         for i, img in enumerate(self.valset):
             assert 'is_hr' in img, i
         for i, img in enumerate(self.trainset):
@@ -502,6 +506,90 @@ class Runner:
                 output_dir=Path(cfg.result_dir),
                 mode="training",
             )
+    
+    # XR-GS Helper --> Function for creating a synthetic pair
+    def precompute_xrgs_pairs_two_res(self, dataset, blur_kernel_size=3):
+        """
+        Precompute synthetic HR/LR counterparts for a dataset with exactly two resolutions.
+        """
+        synthetic_pairs = {}
+        resolutions = {}
+
+        print("[XRGS] Scanning dataset for resolutions")
+
+        # 1. Scan all resolutions
+        for idx in range(len(dataset)):
+            sample = dataset[idx]
+            img = sample["image"]
+            H, W = img.shape[:2]
+
+            resolutions.setdefault((H, W), []).append(idx)
+
+        # 2. Must have exactly two resolutions
+        if len(resolutions) != 2:
+            raise ValueError(
+                f"Expected exactly two resolutions (HR and LR), but found: {list(resolutions.keys())}"
+            )
+
+        # 3. Identify HR and LR by size
+        res_list = list(resolutions.keys())
+        (H1, W1), (H2, W2) = res_list
+
+        if H1 * W1 > H2 * W2:
+            HR_res, LR_res = (H1, W1), (H2, W2)
+        else:
+            HR_res, LR_res = (H2, W2), (H1, W1)
+
+        print(f"[XRGS] Detected HR resolution = {HR_res}, LR resolution = {LR_res}")
+
+        # 4. Build Gaussian blur kernel
+        def gaussian_kernel(channels=3, kernel_size=blur_kernel_size, sigma=1.0):
+            x = torch.arange(kernel_size) - kernel_size // 2
+            g = torch.exp(-(x**2) / (2*sigma*sigma))
+            g = g / g.sum()
+            kernel_2d = torch.einsum("i,j->ij", g, g)
+            return kernel_2d.unsqueeze(0).unsqueeze(0).repeat(channels, 1, 1, 1)
+
+        gauss = gaussian_kernel().to(self.device)
+
+        # 5. Generate synthetic pairs
+        for idx in range(len(dataset)):
+            sample = dataset[idx]
+            img = sample["image"].float().to(self.device) / 255.0
+            H, W = img.shape[:2]
+
+            img = img.permute(2, 0, 1).unsqueeze(0)  # [1,3,H,W]
+
+            if (H, W) == HR_res:
+                is_hr = True
+                # HR to synthetic LR
+                blurred = F.conv2d(img, gauss, padding=blur_kernel_size//2, groups=3)
+                synth = F.interpolate(
+                    blurred,
+                    size=LR_res,
+                    mode="bicubic",
+                    align_corners=True,
+                )
+            else:
+                is_hr = False
+                # LR to synthetic HR (simple bicubic)
+                synth = F.interpolate(
+                    img,
+                    size=HR_res,
+                    mode="bicubic",
+                    align_corners=True,
+                )
+
+            synth = synth.squeeze(0).permute(1, 2, 0).cpu()
+
+            synthetic_pairs[idx] = {
+                "is_hr": is_hr,
+                "paired": synth
+            }
+
+        print("[XRGS] Finished synthetic HR/LR pairing.")
+        return synthetic_pairs
+
 
     def rasterize_splats(
         self,
@@ -754,7 +842,53 @@ class Runner:
                     colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2), padding="valid"
                 )
                 loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
+
+
+            # XR-GS Change: NEW - Consistency Loss
+            if use_xrgs:
+                idx = int(image_ids.item()) 
+                pair = self.synthetic_pairs[idx]
+
+                rendered = colors.detach()
+                rendered = rendered.permute(0, 3, 1, 2) # [1,3,H,W]
+                synth = pair["paired"].to(self.device)
+                synth = synth.permute(2,0,1).unsqueeze(0) # [1,3,H,W]
+
+                # Case 1: This is an HR true image: We should compare rendered downsampled HR with synthetic LR
+                if is_hr:
+                    # Downsample rendered HR to LR size
+                    H_lr, W_lr = synth.shape[-2:]
+                    rendered_proj = F.interpolate(
+                        rendered, size=(H_lr, W_lr),
+                        mode="bicubic", align_corners=True
+                    )
+                    target = synth
+
+                # Case 2: This is an LR true image: Compare rendered upsampled LR with synthetic HR
+                else:
+                    H_hr, W_hr = synth.shape[-2:]
+                    rendered_proj = F.interpolate(
+                        rendered, size=(H_hr, W_hr),
+                        mode="bicubic", align_corners=True
+                    )
+                    target = synth
+
+                # Compute XR-GS consistency loss
+                cons_l1 = F.l1_loss(rendered_proj, target)
+                cons_ssim = 1.0 - fused_ssim(rendered_proj, target, padding="valid")
+                cons_loss = cons_l1 * 0.8 + cons_ssim * 0.2     # tunable
+
+                # Weight depending on HR/LR
+                if is_hr:
+                    cons_w = 0.35        # HR images stronger supervision
+                else:
+                    cons_w = 0.15        # LR images lighter supervision
+
+                # Add to main loss
+                loss += cons_w * cons_loss
             
+
+
             if cfg.depth_loss:
                 # query depths from depth map
                 points = torch.stack(
