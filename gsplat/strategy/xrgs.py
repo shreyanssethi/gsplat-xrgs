@@ -84,6 +84,15 @@ class XRGSStrategy(Strategy):
 
     """
 
+    # XR-GS Changes: Different options for treating LR/HR views differently
+    change_loss_weighting: bool = True                      # --> LR loss will be weighted to be smaller
+    change_grad_scale: bool = True                          # --> LR gradient magnitudes scaled to be smaller
+    change_densify: bool = False                             # --> Different thresholds for HR/LR for densifying gaussians
+    change_prune: bool = False                               # --> Different thresholds for HR/LR for pruning gaussinas
+    change_rendering: bool = False                           # --> Scale splats for LR to be larger (Less detailed)   
+    change_train_seq: bool = False                           # --> Train only on LR images, then switch to HR
+    change_consistency_loss: bool = True                    # --> Adds a consistency loss for comparing synthetic pairs
+
     prune_opa: float = 0.005
 
     # XR-GS Changes: Varying values of the following parameters based on HR/LR Views
@@ -290,12 +299,15 @@ class XRGSStrategy(Strategy):
         device = grads.device
 
         # XR-GS Change: Decide thresholds based on LR/HR View
-        if is_hr:
-            grow_grad2d = self.grow_grad2d_hr
-            grow_scale3d = self.grow_scale3d_hr
+        if self.change_densify:
+            if is_hr:
+                grow_grad2d = self.grow_grad2d_hr
+                grow_scale3d = self.grow_scale3d_hr
+            else:
+                grow_grad2d = self.grow_grad2d_lr
+                grow_scale3d = self.grow_scale3d_lr
         else:
-            grow_grad2d = self.grow_grad2d_lr
-            grow_scale3d = self.grow_scale3d_lr
+            grow_grad2d, grow_scale3d = 0.0002, 0.01
 
         is_grad_high = grads > grow_grad2d
         is_small = (
@@ -345,10 +357,13 @@ class XRGSStrategy(Strategy):
     ) -> int:
 
         # XR-GS Change: Decide thresholds based on LR/HR View
-        if is_hr:
-            prune_scale3d = self.prune_scale3d_hr
+        if self.change_prune:
+            if is_hr:
+                prune_scale3d = self.prune_scale3d_hr
+            else:
+                prune_scale3d = self.prune_scale3d_lr
         else:
-            prune_scale3d = self.prune_scale3d_lr
+            prune_scale3d = 0.1
 
         is_prune = torch.sigmoid(params["opacities"].flatten()) < self.prune_opa
         if step > self.reset_every:

@@ -79,8 +79,8 @@ class Config:
     # Number of training steps
     max_steps: int = 30_000
 
-    # XR-GS Change: Number of LR only train steps --> NOTE: Off by default
-    lr_only_steps: int = 0
+    # XR-GS Change: Number of LR only train steps
+    lr_only_steps: int = 5000
 
     # Steps to evaluate the model
     eval_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
@@ -362,7 +362,7 @@ class Runner:
         self.valset = Dataset(self.parser, split="val")
 
         # XR-GS Change: Create the synthetic LR/HR pair for every image
-        if isinstance(cfg.strategy, XRGSStrategy):
+        if isinstance(cfg.strategy, XRGSStrategy) and cfg.strategy.change_consistency_loss:
             self.synthetic_pairs = self.precompute_xrgs_pairs_two_res(self.trainset)
 
         for i, img in enumerate(self.valset):
@@ -729,10 +729,13 @@ class Runner:
                     except StopIteration:
                         trainloader_iter = iter(trainloader)
                         data = next(trainloader_iter)
+                    
+                    if not use_xrgs or not self.cfg.strategy.change_train_seq:
+                        break
 
-                    # if XRGS is enabled AND we're still in lr_only_steps,
+                    # change_train_seq is enabled AND we're still in lr_only_steps,
                     # we want ONLY low-res batches (i.e., is_hr == False)
-                    if use_xrgs and data["is_hr"] and step < self.cfg.lr_only_steps:
+                    if data["is_hr"] and step < self.cfg.lr_only_steps:
                         # skip this batch, fetch next — but DO NOT increment step
                         continue
 
@@ -763,10 +766,10 @@ class Runner:
             sh_degree_to_use = min(step // cfg.sh_degree_interval, cfg.sh_degree)
 
             # XR-GS Change: Radius Scaling for LR Images (Resolution Aware Rendering)
-            # Done as Ablation -- Did not work well
-            # if use_xrgs and not data["is_hr"]:
-            #     radius_backup = self.splats.scales.data.clone()
-            #     self.splats.scales.data = radius_backup * 1.3 
+            # Did not work well
+            if use_xrgs and self.cfg.strategy.change_rendering and not data["is_hr"]:
+                radius_backup = self.splats.scales.data.clone()
+                self.splats.scales.data = radius_backup * 1.3 
 
             # forward
             renders, alphas, info = self.rasterize_splats(
@@ -784,8 +787,8 @@ class Runner:
             
             # XR-GS: Restore original radii so the model parameters stay correct
             # Done as Ablation -- Did not work well
-            # if use_xrgs and not data["is_hr"]:
-            #     self.splats.scales.data = radius_backup
+            if use_xrgs and self.cfg.strategy.change_rendering and not data["is_hr"]:
+                self.splats.scales.data = radius_backup
 
             if renders.shape[-1] == 4:
                 colors, depths = renders[..., 0:3], renders[..., 3:4]
@@ -818,34 +821,26 @@ class Runner:
                 info=info,
             )
 
-            is_hr = data.get("is_hr", False)
+            is_hr = data.get("is_hr", True)
+
+            l1loss = F.l1_loss(colors, pixels)
+            ssimloss = 1.0 - fused_ssim(
+                    colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2), padding="valid"
+            )
+            loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
 
             # XR-GS Change - Loss is weighted based on the image being HR/LR
-            if use_xrgs:
-                # Radius weights are used for weighing gradient updates
-                if is_hr:
-                    loss_weight = 1.0
-                    radius_weight = 1.0      
-                else:
-                    loss_weight = 0.25
-                    radius_weight = 0.3     
+            if use_xrgs and self.cfg.strategy.change_loss_weighting:
+                loss_weight = 1.0 if is_hr else 0.25
+                loss = loss_weight * loss
 
-                l1loss = F.l1_loss(colors, pixels)
-                ssimloss = 1.0 - fused_ssim(
-                    colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2), padding="valid"
-                )
-                base_loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
-                loss = loss_weight * base_loss
-            else:
-                l1loss = F.l1_loss(colors, pixels)
-                ssimloss = 1.0 - fused_ssim(
-                    colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2), padding="valid"
-                )
-                loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
+            # XR-GS Change - Gradient is scaled based on the image being HR/LR (Applied later in fn)
+            if use_xrgs and self.cfg.strategy.change_grad_scale:
+                radius_weight = 1.0 if is_hr else 0.3
 
 
-            # XR-GS Change: NEW - Consistency Loss
-            if use_xrgs:
+            # XR-GS Change - Consistency Loss for comparing upscaled/downscaled synthetic version
+            if use_xrgs and self.cfg.strategy.change_consistency_loss:
                 idx = int(image_ids.item()) 
                 pair = self.synthetic_pairs[idx]
 
@@ -873,7 +868,7 @@ class Runner:
                     )
                     target = synth
 
-                # Compute XR-GS consistency loss
+                # Compute consistency loss
                 cons_l1 = F.l1_loss(rendered_proj, target)
                 cons_ssim = 1.0 - fused_ssim(rendered_proj, target, padding="valid")
                 cons_loss = cons_l1 * 0.8 + cons_ssim * 0.2     # tunable
@@ -921,7 +916,7 @@ class Runner:
             loss.backward()
 
             # XR-GS Change - Decrease the gradient magnitude for LR images
-            if use_xrgs:
+            if use_xrgs and self.cfg.strategy.change_grad_scale:
                 for name, param in self.splats.named_parameters():
                     if "scale" in name:
                         if param.grad is not None:
