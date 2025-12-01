@@ -87,8 +87,8 @@ class XRGSStrategy(Strategy):
     # XR-GS Changes: Different options for treating LR/HR views differently
     change_loss_weighting: bool = True                      # --> LR loss will be weighted to be smaller
     change_grad_scale: bool = True                          # --> LR gradient magnitudes scaled to be smaller
-    change_densify: bool = False                             # --> Different thresholds for HR/LR for densifying gaussians
-    change_prune: bool = False                               # --> Different thresholds for HR/LR for pruning gaussinas
+    change_densify: bool = True                             # --> Different thresholds for HR/LR for densifying gaussians
+    change_prune: bool = True                               # --> Different thresholds for HR/LR for pruning gaussinas
     change_rendering: bool = False                           # --> Scale splats for LR to be larger (Less detailed)   
     change_train_seq: bool = False                           # --> Train only on LR images, then switch to HR
     change_consistency_loss: bool = True                    # --> Adds a consistency loss for comparing synthetic pairs
